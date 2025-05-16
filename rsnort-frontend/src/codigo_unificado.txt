@@ -1,0 +1,644 @@
+==== CONTENIDO DE: ./main.ts ====
+import { bootstrapApplication } from '@angular/platform-browser';
+import { AppComponent } from './app/app.component';
+import { provideRouter } from '@angular/router';
+import { routes } from './app/app.routes';
+import { provideHttpClient, withInterceptorsFromDi } from '@angular/common/http';
+import { HTTP_INTERCEPTORS } from '@angular/common/http';
+import { JwtInterceptor } from './app/interceptors/jwt.interceptor';
+import { APP_INITIALIZER } from '@angular/core';
+import { AgentService } from './app/services/agent.service';
+
+export function preloadAgents(agentSrv: AgentService) {
+  return () => agentSrv.load();    // ⇢ devuelve una Promise<void>
+}
+
+bootstrapApplication(AppComponent, {
+  providers: [
+    provideHttpClient(withInterceptorsFromDi()),
+    provideRouter(routes),
+    {
+      provide: APP_INITIALIZER,
+      useFactory: preloadAgents,
+      deps: [AgentService],
+      multi: true
+    },
+    { provide: HTTP_INTERCEPTORS, useClass: JwtInterceptor, multi: true }
+  ]
+});
+
+==== CONTENIDO DE: ./app/app.routes.ts ====
+import { Routes } from '@angular/router';
+import { AlertsComponent } from './components/alerts/alerts.component';
+import { authGuard } from './guards/auth.guard';
+
+// src/app/app.routes.ts
+export const routes: Routes = [
+  { path: '', redirectTo: 'login', pathMatch: 'full' },
+
+  {
+    path: 'login',
+    loadComponent: () => import('./components/login/login.component')
+      .then(m => m.LoginComponent)
+  },
+
+  {
+    path: 'overview',
+    loadComponent: () => import('./components/overview/overview.component')
+      .then(m => m.OverviewComponent),
+    canActivate: [authGuard]
+  },
+
+  {
+    path: 'agents/:id',
+    canActivate: [authGuard],            // ⬅️  protege las hijas
+    children: [
+      { path: '', redirectTo: 'alerts', pathMatch: 'full' },
+      {
+        path: 'alerts',
+        loadComponent: () => import('./components/alerts/alerts.component')
+          .then(m => m.AlertsComponent)
+      },
+      {
+        path: 'metrics',
+        loadComponent: () => import('./components/metrics/metrics.component')
+          .then(m => m.MetricsComponent)
+      }
+    ]
+  },
+
+  /* placeholders */
+  {
+    path: 'rules',
+    loadComponent: () => import('./components/placeholder/placeholder.component')
+      .then(m => m.PlaceholderComponent),
+    canActivate: [authGuard]
+  },
+
+  {
+    path: 'status',
+    loadComponent: () => import('./components/placeholder/placeholder.component')
+      .then(m => m.PlaceholderComponent),
+    canActivate: [authGuard]
+  }
+];
+
+==== CONTENIDO DE: ./app/pipes/safe-url.pipe.ts ====
+import { Pipe, PipeTransform } from '@angular/core';
+import { DomSanitizer, SafeResourceUrl } from '@angular/platform-browser';
+
+@Pipe({ name: 'safeUrl', standalone: true })
+export class SafeUrlPipe implements PipeTransform {
+  constructor(private s: DomSanitizer) {}
+  transform(value: string): SafeResourceUrl { return this.s.bypassSecurityTrustResourceUrl(value); }
+}
+
+==== CONTENIDO DE: ./app/models/agent.model.ts ====
+export interface Agent {
+  id: string;
+  ip: string;
+}
+
+==== CONTENIDO DE: ./app/guards/auth.guard.ts ====
+import { inject } from '@angular/core';
+import { CanActivateFn, Router } from '@angular/router';
+import { AuthService } from '../services/auth.service';
+
+export const authGuard: CanActivateFn = () => {
+  const auth = inject(AuthService);
+  const router = inject(Router);
+
+  if (router.url.startsWith('/login') && auth.isLoggedIn()) {
+    router.navigate(['/overview']);   // usuario con token → salta login
+    return false;
+  }
+
+  if (!auth.isLoggedIn()) {
+    router.navigate(['/login']);
+    return false;
+  }
+  return true;
+};
+
+==== CONTENIDO DE: ./app/services/auth.service.ts ====
+import { Injectable } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { tap } from 'rxjs';
+
+@Injectable({
+  providedIn: 'root'
+})
+export class AuthService {
+  private readonly API_URL = '/api/auth';
+
+  constructor(private http: HttpClient) {}
+
+  login(email: string, password: string) {
+    return this.http.post<{ token: string }>(`${this.API_URL}/login`, { email, password })
+      .pipe(tap(response => {
+        localStorage.setItem('token', response.token);
+      }));
+  }
+
+  logout() {
+    localStorage.removeItem('token');
+  }
+
+  isLoggedIn(): boolean {
+    return !!localStorage.getItem('token');
+  }
+
+  getToken(): string | null {
+    return localStorage.getItem('token');
+  }
+}
+
+==== CONTENIDO DE: ./app/services/alert.service.ts ====
+import { Injectable } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Observable, of } from 'rxjs';
+import { AgentService } from './agent.service';
+
+export interface Alert {
+  id: number;
+  timestamp: string;
+  proto: string;
+  dir: string;
+  srcAddr: string;
+  srcPort: number;
+  dstAddr: string;
+  dstPort: number;
+  msg: string;
+  sid: number;
+  gid: number;
+  priority: number;
+}
+
+@Injectable({ providedIn: 'root' })
+export class AlertService {
+  constructor(
+    private http: HttpClient,
+    private agentService: AgentService
+  ) {}
+
+  getLatestAlerts(limit = 10, ip?: string): Observable<Alert[]> {
+    const host = ip ?? this.agentService.current?.ip;
+    if (!host) return of([]);
+
+    const url = `/api/alerts/latest?limit=${limit}`;
+    return this.http.get<Alert[]>(url);
+  }
+}
+
+==== CONTENIDO DE: ./app/services/agent.service.ts ====
+import { Injectable, inject } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Agent } from '../models/agent.model';
+import { BehaviorSubject, firstValueFrom } from 'rxjs';
+
+@Injectable({ providedIn: 'root' })
+export class AgentService {
+  private http = inject(HttpClient);
+  private agents: Agent[] = [];
+
+  private currentSubject = new BehaviorSubject<Agent | null>(null);
+  current$ = this.currentSubject.asObservable();
+
+// src/app/services/agent.service.ts
+async load(): Promise<void> {
+  if (this.agents.length) return;
+
+  try {
+    this.agents = await firstValueFrom(
+      this.http.get<Agent[]>('assets/agents.json')
+    );
+  } catch {
+    console.warn('[AgentService] agents.json no encontrado; uso localhost');
+    this.agents = [{ id: 'local', ip: 'localhost' }];
+  }
+  this.currentSubject.next(this.agents[0]);
+}
+
+  getAll(): Agent[] { return this.agents; }
+
+  get current(): Agent | null {        // 👈 puede ser null
+  return this.currentSubject.value;
+}
+
+  setCurrent(id: string) {
+    const found = this.agents.find(a => a.id === id);
+    if (found) {
+      this.agents.unshift(...this.agents.splice(this.agents.indexOf(found), 1));
+      this.currentSubject.next(this.agents[0]); // 👈 notifica cambio
+    }
+  }
+}
+
+==== CONTENIDO DE: ./app/components/header/header.component.ts ====
+import { Component, inject, OnInit } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { Router } from '@angular/router';
+import { AuthService } from '../../services/auth.service';
+import { AgentService } from '../../services/agent.service';
+
+import { RouterModule } from '@angular/router';
+import { MatToolbarModule } from '@angular/material/toolbar';
+import { MatIconModule } from '@angular/material/icon';
+import { MatButtonModule } from '@angular/material/button';
+import { MatMenuModule } from '@angular/material/menu';
+import { MatSelectModule } from '@angular/material/select';
+import { MatFormFieldModule } from '@angular/material/form-field';
+import { MatOptionModule } from '@angular/material/core';
+
+@Component({
+  selector: 'app-header',
+  standalone: true,
+  imports: [
+    CommonModule,
+    RouterModule,
+    MatToolbarModule,
+    MatIconModule,
+    MatButtonModule,
+    MatMenuModule,
+    MatSelectModule,
+    MatFormFieldModule,
+    MatOptionModule
+  ],
+  templateUrl: './header.component.html',
+  styleUrls: ['./header.component.css']
+})
+export class HeaderComponent implements OnInit {
+  private auth = inject(AuthService);
+  private router = inject(Router);
+  agentSrv = inject(AgentService);
+
+  agents: { id: string; ip: string }[] = [];
+  currentId = '';
+
+  async ngOnInit() {
+    await this.agentSrv.load();
+    this.agents = this.agentSrv.getAll();
+    this.currentId = this.agentSrv.current?.id || '';
+  }
+
+  logout() {
+    this.auth.logout();
+    this.router.navigate(['/login']);
+  }
+
+  switchAgent(id: string) {
+    this.agentSrv.setCurrent(id);
+    const seg = this.router.url.split('/').pop()!;
+    const sub = (seg === 'metrics') ? 'metrics' : 'alerts';
+    this.router.navigate(['/agents', id, sub]);
+  }
+}
+
+==== CONTENIDO DE: ./app/components/header/header.component.html ====
+<mat-toolbar color="primary" class="rsnort-toolbar" role="banner">
+  <div class="logo-container" routerLink="/">
+    <img src="assets/logo.svg" alt="Logo" class="logo" />
+    <span class="title">R-SNORT WebApp</span>
+  </div>
+
+  <span class="spacer"></span>
+
+
+<nav class="nav-links">
+  <a mat-button routerLink="/overview" routerLinkActive="active-link">Overview</a>
+
+  <a mat-button
+     [routerLink]="['/agents', agentSrv.current?.id, 'alerts']"
+     routerLinkActive="active-link">Alertas</a>
+
+  <a mat-button
+     [routerLink]="['/agents', agentSrv.current?.id, 'metrics']"
+     routerLinkActive="active-link">Métricas</a>
+
+  <a mat-button routerLink="/rules"   routerLinkActive="active-link">Reglas</a>
+  <a mat-button routerLink="/status"  routerLinkActive="active-link">Estado</a>
+</nav>
+
+  <!-- Nuevo selector de agentes con <mat-select> -->
+  <mat-form-field appearance="fill" class="agent-select">
+    <mat-label>Agente</mat-label>
+    <mat-select [value]="currentId" (selectionChange)="switchAgent($event.value)">
+      <mat-option *ngFor="let a of agents" [value]="a.id">
+        {{ a.id === 'central' ? '🌐 Central (' + a.ip + ')' : a.ip }}
+      </mat-option>
+    </mat-select>
+  </mat-form-field>
+
+  <!-- Botón de notificaciones -->
+  <button mat-icon-button aria-label="Notificaciones" disabled>
+    <mat-icon>notifications_none</mat-icon>
+  </button>
+
+  <!-- Menú de usuario -->
+  <button mat-icon-button [matMenuTriggerFor]="userMenu">
+    <mat-icon>account_circle</mat-icon>
+  </button>
+  <mat-menu #userMenu="matMenu">
+    <button mat-menu-item (click)="logout()">
+      <mat-icon>logout</mat-icon>
+      <span>Salir</span>
+    </button>
+  </mat-menu>
+</mat-toolbar>
+
+==== CONTENIDO DE: ./app/components/alerts/alerts.component.ts ====
+import { Component, inject, OnInit } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { AgentService } from '../../services/agent.service';
+import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
+import { GrafanaFrameComponent } from '../grafana-frame/grafana-frame.component';
+
+@Component({
+  selector: 'app-alerts',
+  standalone: true,
+  imports: [
+    CommonModule,
+    MatProgressSpinnerModule,
+    GrafanaFrameComponent
+  ],
+  templateUrl: './alerts.component.html',
+  styleUrls: ['./alerts.component.css']
+})
+export class AlertsComponent {
+  agentSrv = inject(AgentService);
+}
+
+==== CONTENIDO DE: ./app/components/alerts/alerts.component.html ====
+<div class="dashboard-container">
+  <h1 class="title">⚠️ Últimas Alertas en Tiempo Real</h1>
+
+  <ng-container *ngIf="agentSrv.current as cur; else loadingAgents">
+    <grafana-frame
+      [ip]="cur.ip"
+      path="/d-solo/ALgSiPiWk/snort-ids-ips-dashboard?orgId=1&panelId=26&refresh=10s">
+    </grafana-frame>
+  </ng-container>
+
+  <ng-template #loadingAgents>
+    <mat-spinner></mat-spinner>
+  </ng-template>
+</div>
+
+==== CONTENIDO DE: ./app/components/login/login.component.ts ====
+import { Component } from '@angular/core';
+import { FormBuilder, FormGroup, Validators } from '@angular/forms';
+import { AuthService } from '../../services/auth.service';
+import { Router } from '@angular/router';
+import { CommonModule } from '@angular/common';
+import { MatCardModule } from '@angular/material/card';
+import { MatFormFieldModule } from '@angular/material/form-field';
+import { MatInputModule } from '@angular/material/input';
+import { MatButtonModule } from '@angular/material/button';
+import { ReactiveFormsModule } from '@angular/forms';
+
+@Component({
+  selector: 'app-login',
+  standalone: true,
+  imports: [
+    CommonModule,
+    ReactiveFormsModule,
+    MatCardModule,
+    MatFormFieldModule,
+    MatInputModule,
+    MatButtonModule
+  ],
+  templateUrl: './login.component.html',
+  styleUrls: ['./login.component.css']
+})
+export class LoginComponent {
+  form: FormGroup;
+
+  constructor(
+    private fb: FormBuilder,
+    private auth: AuthService,
+    private router: Router
+  ) {
+    this.form = this.fb.group({
+      email: ['', [Validators.required, Validators.email]],
+      password: ['', Validators.required]
+    });
+  }
+
+  onSubmit() {
+    if (this.form.valid) {
+      const { email, password } = this.form.value;
+
+      this.auth.login(email, password).subscribe({
+        next: () => this.router.navigate(['/overview']),
+        error: err => alert('Login fallido: ' + err.message)
+      });
+    }
+  }
+}
+
+==== CONTENIDO DE: ./app/components/login/login.component.html ====
+<div class="login-container">
+  <mat-card class="login-card">
+    <h2 class="login-title">Iniciar sesión</h2>
+
+    <form [formGroup]="form" (ngSubmit)="onSubmit()">
+      <mat-form-field appearance="fill" class="login-field">
+        <mat-label>Correo electrónico</mat-label>
+        <input matInput formControlName="email" placeholder="ej. admin@example.com" />
+      </mat-form-field>
+
+      <mat-form-field appearance="fill" class="login-field">
+        <mat-label>Contraseña</mat-label>
+        <input matInput [type]="'password'" formControlName="password" />
+      </mat-form-field>
+
+      <button mat-raised-button color="primary" class="login-button" type="submit">
+        Acceder
+      </button>
+    </form>
+  </mat-card>
+</div>
+
+==== CONTENIDO DE: ./app/components/metrics/metrics.component.ts ====
+import { Component, OnInit, inject } from '@angular/core';
+import { CommonModule }      from '@angular/common';
+import { GrafanaFrameComponent } from '../grafana-frame/grafana-frame.component';
+import { AgentService }      from '../../services/agent.service';
+import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
+
+@Component({
+  selector   : 'app-metrics',
+  standalone : true,
+  imports    : [CommonModule, GrafanaFrameComponent, MatProgressSpinnerModule],
+  templateUrl: './metrics.component.html',
+  styleUrls  : ['./metrics.component.css']
+})
+export class MetricsComponent {
+  agentSrv = inject(AgentService);
+}
+
+==== CONTENIDO DE: ./app/components/metrics/metrics.component.html ====
+<ng-container *ngIf="agentSrv.current as cur; else loading">
+  <div class="grafana-grid">
+
+    <!-- Temperatura → panelId 29 -->
+    <grafana-frame [ip]="cur.ip"
+      path="/d-solo/ALgSiPiWk/snort-ids-ips-dashboard?orgId=1&panelId=29&refresh=30s">
+    </grafana-frame>
+
+    <!-- CPU & Disco → panelId 28 -->
+    <grafana-frame [ip]="cur.ip"
+      path="/d-solo/ALgSiPiWk/snort-ids-ips-dashboard?orgId=1&panelId=28&refresh=30s">
+    </grafana-frame>
+
+    <!-- Donut Top protocolos → 22 -->
+    <grafana-frame [ip]="cur.ip"
+      path="/d-solo/ALgSiPiWk/snort-ids-ips-dashboard?orgId=1&panelId=22&refresh=1m">
+    </grafana-frame>
+
+    <!-- Heat-map protocolos/time → 13 -->
+    <grafana-frame [ip]="cur.ip"
+      path="/d-solo/ALgSiPiWk/snort-ids-ips-dashboard?orgId=1&panelId=13&refresh=1m">
+    </grafana-frame>
+
+    <!-- Top IP origen (7) -->
+    <grafana-frame [ip]="cur.ip"
+      path="/d-solo/ALgSiPiWk/snort-ids-ips-dashboard?orgId=1&panelId=7&refresh=1m">
+    </grafana-frame>
+    <!-- Top IP destino (6) -->
+    <grafana-frame [ip]="cur.ip"
+      path="/d-solo/ALgSiPiWk/snort-ids-ips-dashboard?orgId=1&panelId=6&refresh=1m">
+    </grafana-frame>
+    <!-- Top puertos destino (8) -->
+    <grafana-frame [ip]="cur.ip"
+      path="/d-solo/ALgSiPiWk/snort-ids-ips-dashboard?orgId=1&panelId=8&refresh=1m">
+    </grafana-frame>
+
+    <!-- Tabla de alertas en vivo (26)  ocupa todo -->
+    <grafana-frame class="wide"
+      [ip]="cur.ip"
+      path="/d-solo/ALgSiPiWk/snort-ids-ips-dashboard?orgId=1&panelId=26&refresh=10s">
+    </grafana-frame>
+  </div>
+</ng-container>
+
+<ng-template #loading>
+  <mat-spinner></mat-spinner>
+</ng-template>
+
+==== CONTENIDO DE: ./app/components/overview/overview.component.html ====
+<ng-container *ngIf="central$ | async as central">
+  <mat-grid-list cols="3" gutterSize="12px" rowHeight="260px">
+
+    <!-- Comparación severidad (panel 1) -->
+    <mat-grid-tile colspan="3" rowspan="2">
+      <grafana-frame [ip]="central.ip"
+                     path="/d-solo/ALgSiPiWk/snort-ids-ips-dashboard?orgId=1&panelId=1&refresh=30s">
+      </grafana-frame>
+    </mat-grid-tile>
+
+    <!-- Temperatura -->
+    <mat-grid-tile>
+      <grafana-frame [ip]="central.ip"
+                     path="/d-solo/ALgSiPiWk/snort-ids-ips-dashboard?orgId=1&panelId=29&refresh=30s">
+      </grafana-frame>
+    </mat-grid-tile>
+
+    <!-- Uso CPU/disco -->
+    <mat-grid-tile>
+      <grafana-frame [ip]="central.ip"
+                     path="/d-solo/ALgSiPiWk/snort-ids-ips-dashboard?orgId=1&panelId=28&refresh=30s">
+      </grafana-frame>
+    </mat-grid-tile>
+
+    <!-- Tabla: Últimas alertas -->
+    <mat-grid-tile colspan="3">
+      <grafana-frame [ip]="central.ip"
+                     path="/d-solo/ALgSiPiWk/snort-ids-ips-dashboard?orgId=1&panelId=26&refresh=10s">
+      </grafana-frame>
+    </mat-grid-tile>
+
+  </mat-grid-list>
+</ng-container>
+
+==== CONTENIDO DE: ./app/components/overview/overview.component.ts ====
+import { Component, inject, OnInit } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { MatGridListModule } from '@angular/material/grid-list';
+import { AgentService } from '../../services/agent.service';
+import { GrafanaFrameComponent } from '../grafana-frame/grafana-frame.component';
+import { map, Observable } from 'rxjs';
+
+@Component({
+  selector: 'app-overview',
+  standalone: true,
+  imports: [
+    CommonModule,
+    MatGridListModule,
+    GrafanaFrameComponent
+  ],
+  templateUrl: './overview.component.html',
+  styleUrls: ['./overview.component.css']
+})
+export class OverviewComponent implements OnInit {
+  agentSrv = inject(AgentService);
+  central$!: Observable<{ id: string; ip: string } | null>;
+
+  ngOnInit() {
+    this.central$ = this.agentSrv.current$.pipe(
+      map(agent => agent?.id === 'central' ? agent : null)
+    );
+  }
+}
+
+==== CONTENIDO DE: ./app/interceptors/jwt.interceptor.ts ====
+import { Injectable } from '@angular/core';
+import { HttpEvent, HttpHandler, HttpInterceptor, HttpRequest } from '@angular/common/http';
+import { Observable } from 'rxjs';
+import { AuthService } from '../services/auth.service';
+
+@Injectable({
+    providedIn: 'root'
+})
+export class JwtInterceptor implements HttpInterceptor {
+    constructor(private auth: AuthService) { }
+
+    intercept(req: HttpRequest<any>, next: HttpHandler): Observable<HttpEvent<any>> {
+        const token = this.auth.getToken();
+
+        if (token) {
+            req = req.clone({
+                setHeaders: { Authorization: `Bearer ${token}` }
+            });
+        }
+
+        return next.handle(req);
+    }
+}
+
+==== CONTENIDO DE: ./app/app.component.ts ====
+import { Component, inject } from '@angular/core';
+import { RouterOutlet, Router } from '@angular/router';
+import { CommonModule } from '@angular/common'; // 👈 IMPORTANTE
+import { HeaderComponent } from './components/header/header.component';
+import { AuthService } from './services/auth.service';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [
+    CommonModule, // 👈 Agrega esto
+    RouterOutlet,
+    HeaderComponent
+  ],
+  templateUrl: './app.component.html',
+  styleUrls: ['./app.component.css']
+})
+export class AppComponent {
+  private router = inject(Router);
+  private auth = inject(AuthService);
+
+  shouldShowHeader(): boolean {
+    return this.router.url !== '/login' && this.auth.isLoggedIn();
+  }
+}
